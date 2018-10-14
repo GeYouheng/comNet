@@ -5,6 +5,7 @@
 #include <thread>
 #include <map>
 #include <queue>
+#include <mutex>
 #include <cstdio>
 #include<cstring>
 #include <ctime>
@@ -12,7 +13,7 @@
 
 #define SERVER_PORT	6666 //侦听端口
 #define MaxClient 8
-#define ServerName "Server1"
+#define ServerName "Server X"
 
 struct Client {
 	char ip[20];
@@ -29,7 +30,7 @@ class Server
 {
 public:
 	Server() {
-
+		
 	}
 
 	~Server() {
@@ -138,15 +139,35 @@ public:
 	static void runService(SOCKET arg, SOCKADDR_IN client_addr, int pos, Server * pthis){	
 		int sen, ret;
 		while (true) {
-			//首先处理服务器内消息队列中的请求
-			if (pthis->queueMessege.size() > 0) { 
+			pthis->g_lock.lock();
+			//首先处理服务器内任务队列中的请求
+			if (pthis->queueMessege.size() > 0) {
 				//如果该线程被其他线程要求发送指令数据包
-				if (pthis->queueMessege.front().to == pos) {
+				if (pthis->queueMessege.front().to == pos && pthis->queueMessege.front().processed == false) {
+					respond pre_ins;
+					pre_ins.type = PRE_INS;
+					sen = send(arg, (char*)&(pre_ins), sizeof(pre_ins), 0); //向指定客户端发送信息
+					if (sen == SOCKET_ERROR) {
+						if (WSAGetLastError() == WSAEWOULDBLOCK)
+							continue;
+						else
+							printf("send() failed! code:%d\n", WSAGetLastError());
+					}
+					else if (sen == 0) { //已经断开连接，则关闭线程
+						std::thread t = std::thread(closeService, pos, client_addr, pthis);
+						t.detach();
+						return;
+					}
+
 					Message &msg = pthis->queueMessege.front();
 					sen = send(arg, (char*)&(msg.ins), sizeof(msg.ins), 0); //向指定客户端发送信息
 					msg.processed = true; //标记该请求已被处理
-					if (sen == SOCKET_ERROR) 
-						printf("send() failed! code:%d\n", WSAGetLastError());
+					if (sen == SOCKET_ERROR) {
+						if (WSAGetLastError() == WSAEWOULDBLOCK)
+							continue;
+						else
+							printf("send() failed! code:%d\n", WSAGetLastError());
+					}
 					else if (sen == 0) { //已经断开连接，则关闭线程
 						std::thread t = std::thread(closeService, pos, client_addr, pthis);
 						t.detach();
@@ -157,14 +178,14 @@ public:
 					}
 				}
 				//如果该线程要求发送的指令数据包已经被处理
-				else if (pthis->queueMessege.front().from == pos&& pthis->queueMessege.front().processed == true) { 
+				else if (pthis->queueMessege.front().from == pos && pthis->queueMessege.front().processed == true) {
 					respond res;
 					res.type = SEND_RES;
 					if (pthis->queueMessege.front().sent) //成功送达
 						strcpy(res.data, "SUCCESS: The message has been sent!");
 					else //发送失败
 						strcpy(res.data, "ERROR: The client is not in the list.");
-					pthis->queueMessege.pop(); //将该消息从消息队列中删除
+					pthis->queueMessege.pop(); //将该消息从任务队列中删除
 					sen = send(arg, (char*)&res, sizeof(res), 0); //向客户端发送反馈信息
 					if (sen == SOCKET_ERROR)
 						printf("send() failed! code:%d\n", WSAGetLastError());
@@ -175,6 +196,7 @@ public:
 					}
 				}
 			}
+			pthis->g_lock.unlock();
 
 			//其次处理客户端的请求
 			request req;
@@ -209,7 +231,7 @@ public:
 					printf("send() failed! code:%d\n", WSAGetLastError());
 				break;
 			case NAME: //请求类型为获取名字
-				res.type = TIME;
+				res.type = NAME;
 				strcpy(res.data, ServerName);
 				sen = send(arg, (char*)&res, sizeof(res), 0);
 				if (sen == SOCKET_ERROR)
@@ -218,16 +240,22 @@ public:
 			case LIST: //请求类型为获取客户端列表
 				res.type = LIST;
 				char list[300];
+				memset(list, '\n', 300);
 				char* plist;
 				plist=list;
 				//遍历客户端列表，将客户端信息存至字符串数组中
 				for (auto iter = pthis->mapClient.begin(); iter != pthis->mapClient.end(); iter++) {
 					char clinfo[30] = { 0 };
-					sprintf(clinfo, "%d/t%s/t%d", iter->first, iter->second.ip, iter->second.port);
+					if (iter->first == pos) {
+						sprintf(clinfo, "%d\t%s\t%d\t(You)", iter->first, iter->second.ip, iter->second.port);
+					}
+					else {
+						sprintf(clinfo, "%d\t%s\t%d", iter->first, iter->second.ip, iter->second.port);
+					}
 					strcpy(plist, clinfo);
 					plist += 30;
 				}
-				strcpy(res.data, list);
+				memcpy(res.data, list,300);
 				sen = send(arg, (char*)&res, sizeof(res), 0);
 				if (sen == SOCKET_ERROR)
 					printf("send() failed! code:%d\n", WSAGetLastError());
@@ -241,18 +269,21 @@ public:
 				else {
 					//组装指示数据包
 					instruct ins;
+					memset(ins.content, 0, 100);
+					ins.number = pos;
 					strcpy(ins.content, req.content);
 					strcpy(ins.ip, pthis->mapClient[pos].ip);
 					sprintf(ins.port, "%d", pthis->mapClient[pos].port);
-					//组装消息队列内请求信息
+					//组装任务队列内请求信息
 					Message msg;
 					msg.ins = ins;
 					msg.from = pos;
 					msg.to = req.number;
 					msg.processed = msg.sent = false;
-					//将该消息加入消息队列中
+					//将该消息加入任务队列中
 					pthis->queueMessege.push(msg);
 				}
+				break;
 			default:
 				printf("ERROR: The request from the client %d can't be recognized!\n", pos);
 				break;
@@ -264,12 +295,13 @@ public:
 		pthis->mapClient.erase(number);
 		//TerminateThread(pthis->mapThread[number].native_handle(), 0);
 		pthis->mapThread.erase(number);
-		printf("Client %d (%s:%d) misconnected.\n",number, inet_ntoa(saClient.sin_addr), ntohs(saClient.sin_port));
+		printf("Client %d (%s:%d) disconnected.\n",number, inet_ntoa(saClient.sin_addr), ntohs(saClient.sin_port));
 	}
 
 private:
 	SOCKET sListen, sServer; //侦听套接字，连接套接字
 	std::map <int, std::thread> mapThread; //存储线程信息
 	std::map <int, Client> mapClient; //存储客户端信息
-	std::queue <Message> queueMessege; //用于转发数据的消息队列
+	std::queue <Message> queueMessege; //用于转发数据的任务队列
+	std::mutex g_lock;
 };

@@ -1,6 +1,6 @@
 #pragma once
 
-enum mType { TIME,NAME,LIST,SEND,SEND_RES };
+enum mType { TIME,NAME,LIST,SEND,SEND_RES,PRE_INS };
 
 struct request {
 	mType type;
